@@ -1,131 +1,130 @@
-use spider::website::Website;
+use anyhow::Result;
+use clap::Parser;
+use serde::Serialize;
+use spider::features::chrome_common::CaptureScreenshotFormat;
 use spider::page::Page;
-use spider::configuration::{
-    WaitForIdleNetwork, WaitForSelector, CaptureScreenshotFormat, CaptureScreenshotParams,
-    ClipViewport, ScreenShotConfig, ScreenshotParams,
-};
+use spider::page::AntiBotTech;
+use spider::website::{self, Website};
+use spider::configuration::WaitForIdleNetwork;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-#[spider::tokio::main] // uses spider's re-export of tokio
-async fn main() {
-    // Assume you already parsed args: args.url: String,
-    // args.headless_idle_ms: u64, args.selector: Option<String>, args.screenshot: bool
+/// Simple probe utility using spider's smart HTTP→headless fallback.
+#[derive(Parser, Debug)]
+#[command(name = "spider-probe", about = "HTTP-first fetch with headless fallback")]
+struct Args {
+    /// URL to fetch
+    url: String,
 
+    /// Optional path to save a screenshot (PNG). Example: ./page.png
+    #[arg(long)]
+    screenshot: Option<String>,
+
+    /// Milliseconds to wait for network idle when in headless mode
+    #[arg(long, default_value = "1500")]
+    headless_idle_ms: u64,
+
+    /// Request timeout (seconds)
+    #[arg(long, default_value = "30")]
+    timeout_s: u64,
+}
+
+#[derive(Serialize)]
+struct ProbeResult {
+    input_url: String,
+    final_url: String,
+    http_status: u16,
+    redirected: bool,
+    requires_javascript: bool,
+    waf_detected: bool,
+    anti_bot_vendor: Option<String>,
+    js_challenge_page: bool,
+    screenshot_path: Option<String>,
+    html: String,
+    /// Total time spent in milliseconds
+    elapsed_ms: u64,
+    /// Number of pages captured during the crawl
+    pages_crawled: usize,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    let start = Instant::now();
+
+    // Build a Website rooted at the provided URL but limit to just the root (depth=0).
     let mut site = Website::new(&args.url);
+    site.with_depth(0) // single page
+        .with_respect_robots_txt(true) // be polite by default
+        .with_request_timeout(Some(Duration::from_secs(args.timeout_s)))
+        .with_redirect_limit(10)
+        // Wait a bit for the page to settle when using headless
+        .with_wait_for_idle_network(Some(WaitForIdleNetwork::new(Some(Duration::from_millis(
+            args.headless_idle_ms,
+        )))));
 
-    // --- chrome & smart fallback related toggles ---
-    // (Requires features: "smart", "chrome"; chrome only takes effect if a Chrome is available.)
-    site
-        // Auto-wait for network idleness in headless mode (wrap Duration in WaitForIdleNetwork)
-        .with_wait_for_idle_network(Some(WaitForIdleNetwork::new(
-            Some(Duration::from_millis(args.headless_idle_ms)),
-        )))
-        // Optionally wait for a selector if you want deterministic “rendered” state:
-        .with_wait_for_selector(args.selector.as_ref().map(|sel| {
-            WaitForSelector::new(Some(Duration::from_secs(30)), sel.to_string())
-        }))
-        // Optional: capture screenshot bytes later via Page::screenshot; if you prefer
-        // the crate to save screenshots automatically for *every* page, configure:
-        .with_screenshot(
-            if args.screenshot {
-                Some(ScreenShotConfig::new(
-                    ScreenshotParams::new(
-                        CaptureScreenshotParams {
-                            format: Some(CaptureScreenshotFormat::Png),
-                            quality: None,
-                            clip: None,
-                            from_surface: None,
-                            capture_beyond_viewport: Some(true),
-                        },
-                        Some(true),  // full_page
-                        Some(false), // omit_background
-                    ),
-                    true,  // also keep bytes on Page (when supported)
-                    false, // don't auto-save to disk
-                    None,  // no output dir
-                ))
-            } else {
-                None
-            }
-        )
-        // A few practical toggles when doing dynamic pages / bot-avoidance:
-        .with_modify_headers(true)   // make headers look more browser-like
-        .with_stealth(true)          // stealth anti-bot heuristics (needs "chrome")
-        .with_block_assets(true)     // focus on HTML (you can turn off if you need CSS/JS files)
-        .with_caching(true);         // honor HTTP cache (needs "cache" or "chrome")
+    // Smart scrape = HTTP first; escalate to Chrome only if needed (requires `smart` + `chrome` features).
+    site.scrape_smart().await;
 
-    // If you have a remote Chrome, point to it; otherwise spider will manage a local Chrome.
-    // std::env::set_var("CHROME_URL", "ws://localhost:9222/devtools/browser/<id>");
+    let pages = site.get_pages().expect("no pages captured");
+    let pages_crawled = pages.len();
 
-    // Smart scraping: HTTP first; render with Chrome only when needed.
-    site.scrape_smart().await; // requires "smart" feature. :contentReference[oaicite:5]{index=5}
+    // Find the page corresponding to the root URL (there should be exactly one at depth=0).
+    let mut chosen: Option<&Page> = None;
+    for p in pages.iter() {
+        // Prefer exact match on final URL when available, otherwise the original.
+        if p.get_url() == args.url || p.get_url_final() == args.url {
+            chosen = Some(p);
+            break;
+        }
+    }
+    // Fallback if the above heuristic didn't match
+    let page = chosen.unwrap_or_else(|| pages.first().expect("no page captured"));
 
-    // --- Choose the page we care about ---
-    // pages_opt: Option<&Vec<Page>>
-    let pages_opt = site.get_pages();
+    let status = page.status_code.as_u16();
+    let (input_url, final_url) = (page.get_url().to_string(), page.get_url_final().to_string());
+    // Note: final_redirect_destination is not populated when Chrome handled the fetch path.
+    // In that case redirected==false may simply mean "unknown from HTTP path".
+    let redirected = final_url != input_url;
 
-    // Prefer the page that matches the original or final URL; else fall back to first page.
-    let chosen: &Page = pages_opt
-        .and_then(|pages| {
-            pages.iter().find(|p| {
-                p.get_url() == args.url || p.get_url_final() == args.url
-            })
-        })
-        .or_else(|| pages_opt.and_then(|pages| pages.first()))
-        .expect("no page captured"); // handle the 'no page' case however you like
+    // Detect WAF / anti-bot
+    let waf_detected = page.waf_check;
+    let anti_bot_vendor = match page.anti_bot_tech {
+        AntiBotTech::None => None,
+        ref other => Some(format!("{:?}", other)),
+    };
+    let js_challenge_page = website::is_safe_javascript_challenge(page);
 
-    // --- Collect the output you wanted ---
-    // HTML
-    let html = chosen.get_html(); // or String::from_utf8_lossy(chosen.get_html_bytes_u8())
-
-    // Redirect tracking
-    // Note: for pure Chrome-rendered fetches the crate notes that the
-    // final redirect destination is *not implemented in chrome mode*.
-    // You still get the original URL via get_url()/get_url_final().
-    let url_original = chosen.get_url().to_string();
-    let url_final = chosen.get_url_final().to_string(); // falls back to original if None
-
-    // WAF / bot tracking (Cloudflare/others are reported via anti_bot_tech, with a boolean waf_check)
-    let waf = chosen.waf_check;
-    let anti_bot = format!("{:?}", chosen.anti_bot_tech);
-
-    // Optional screenshot (requires features "chrome" + "chrome_store_page")
-    let screenshot_path = if args.screenshot {
-        use std::path::PathBuf;
-        let path = PathBuf::from("screenshot.png");
-        // Full-page PNG, omit_background = false, no custom clip
-        let _bytes = chosen
-            .screenshot(
-                true,
-                false,
-                CaptureScreenshotFormat::Png,
-                None,
-                Some(&path),
-                None::<ClipViewport>,
-            )
+    // Optionally capture a screenshot (works when Chrome path was used; requires `chrome_store_page`).
+    let screenshot_path = if let Some(path) = &args.screenshot {
+        // full_page=true, omit_bg=true, format=PNG, quality=None, output_path=Some(path), clip=None
+        let _bytes = page
+            .screenshot(true, true, CaptureScreenshotFormat::Png, None, Some(path), None)
             .await;
-        Some(path.to_string_lossy().to_string())
+        Some(path.clone())
     } else {
         None
     };
 
-    // Your prototype output
-    println!(
-        "{{\"url_original\":\"{}\",\"url_final\":\"{}\",\"redirected\":{},\"waf_check\":{},\"anti_bot\":\"{}\",\"screenshot_path\":{},\"html_len\":{}}}",
-        url_original,
-        url_final,
-        (url_final != url_original),
-        waf,
-        anti_bot,
-        screenshot_path
-            .as_ref()
-            .map(|s| format!("\"{}\"", s))
-            .unwrap_or_else(|| "null".to_string()),
-        html.len()
-    );
+    let html = String::from_utf8_lossy(page.get_html_bytes_u8()).to_string();
+    let elapsed_ms = start.elapsed().as_millis() as u64;
 
-    // If you want to actually return the HTML:
-    // println!("{}", html);
+    let out = ProbeResult {
+        input_url,
+        final_url,
+        http_status: status,
+        redirected,
+        requires_javascript: site.get_requires_javascript(),
+        waf_detected,
+        anti_bot_vendor,
+        js_challenge_page,
+        screenshot_path,
+        html,
+        elapsed_ms,
+        pages_crawled,
+    };
+
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
 }
 
