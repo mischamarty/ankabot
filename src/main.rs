@@ -1,7 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 fn default_pdf_path(url: &str) -> PathBuf {
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -36,9 +39,18 @@ struct Cli {
     /// Always render with headless Chrome
     #[arg(long)]
     force_chrome: bool,
-    /// Milliseconds to allow page JS to settle under Chrome
-    #[arg(long, default_value_t = 6000)]
-    render_ms: u64,
+    /// Overall deadline for page load waits
+    #[arg(long, default_value_t = 12000)]
+    max_wait_ms: u64,
+    /// document.readyState to await ("complete" | "interactive" | "none")
+    #[arg(long, default_value = "complete")]
+    wait_ready: String,
+    /// How long network must stay idle (pending requests 0)
+    #[arg(long, default_value_t = 1000)]
+    network_idle_ms: u64,
+    /// Optional CSS selector to wait for
+    #[arg(long)]
+    wait_selector: Option<String>,
     /// Save a screenshot (PNG) when Chrome is used
     #[arg(long)]
     screenshot: Option<PathBuf>,
@@ -72,6 +84,14 @@ struct Cli {
     /// Proxy server URL (http:// or socks5://)
     #[arg(long)]
     proxy: Option<String>,
+}
+
+impl Cli {
+    fn locale_or_default(&self) -> String {
+        self.locale
+            .clone()
+            .unwrap_or_else(|| "en-US,en;q=0.9".to_string())
+    }
 }
 
 #[derive(Serialize)]
@@ -137,7 +157,6 @@ async fn main() -> Result<()> {
 
     let chrome = fetch_with_chrome(
         &args.url,
-        Duration::from_millis(args.render_ms),
         args.screenshot.as_ref(),
         pdf_path.as_ref(),
         &args,
@@ -298,9 +317,111 @@ fn export_cookies_from_chrome(tab: &headless_chrome::Tab) -> Result<Vec<CookieJs
     Ok(out)
 }
 
+const INJECT_INSTRUMENT_JS: &str = r#"
+(() => {
+  if (window.__ankabot) return;
+  window.__ankabot = { pending: 0 };
+
+  if (performance && performance.setResourceTimingBufferSize) {
+    performance.setResourceTimingBufferSize(20000);
+  }
+
+  const ofetch = window.fetch;
+  if (ofetch) {
+    window.fetch = function(...args) {
+      window.__ankabot.pending++;
+      return ofetch.apply(this, args)
+        .catch(e => e)
+        .finally(() => { window.__ankabot.pending--; });
+    }
+  }
+
+  const oSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function(...args) {
+    window.__ankabot.pending++;
+    this.addEventListener('loadend', () => { window.__ankabot.pending--; }, { once: true });
+    return oSend.apply(this, args);
+  };
+})();
+"#;
+
+fn wait_for_ready_state(tab: &headless_chrome::Tab, want: &str, deadline: Instant) -> Result<()> {
+    if want.eq_ignore_ascii_case("none") {
+        return Ok(());
+    }
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("readyState timeout"));
+        }
+        let val = tab
+            .evaluate("document.readyState", false)?
+            .value
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let ok = match want {
+            "interactive" => val == "interactive" || val == "complete",
+            _ => val == "complete",
+        };
+        if ok {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_selector(tab: &headless_chrome::Tab, sel: &str, deadline: Instant) -> Result<()> {
+    while Instant::now() < deadline {
+        if tab.find_element(sel).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    Err(anyhow!("selector '{}' not found before timeout", sel))
+}
+
+fn wait_for_network_idle(
+    tab: &headless_chrome::Tab,
+    idle_ms: u64,
+    deadline: Instant,
+) -> Result<()> {
+    let idle = Duration::from_millis(idle_ms);
+    let mut last_cnt: i64 = -1;
+    let mut last_zero_since: Option<Instant> = None;
+
+    while Instant::now() < deadline {
+        let pending = tab
+            .evaluate("window.__ankabot ? window.__ankabot.pending : 0", false)?
+            .value
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let cnt = tab
+            .evaluate("performance.getEntriesByType('resource').length", false)?
+            .value
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let stable = cnt == last_cnt;
+        let zero_pending = pending == 0;
+
+        if zero_pending && stable {
+            if last_zero_since.is_none() {
+                last_zero_since = Some(Instant::now());
+            }
+            if Instant::now().duration_since(last_zero_since.unwrap()) >= idle {
+                return Ok(());
+            }
+        } else {
+            last_zero_since = None;
+        }
+
+        last_cnt = cnt;
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err(anyhow!("network idle timeout"))
+}
+
 fn fetch_with_chrome(
     url: &str,
-    budget: Duration,
     screenshot: Option<&PathBuf>,
     pdf_path: Option<&PathBuf>,
     args: &Cli,
@@ -309,7 +430,7 @@ fn fetch_with_chrome(
         protocol::cdp::Emulation::{
             SetGeolocationOverride, SetLocaleOverride, SetTimezoneOverride,
         },
-        protocol::cdp::Page::CaptureScreenshotFormatOption,
+        protocol::cdp::Page::{AddScriptToEvaluateOnNewDocument, CaptureScreenshotFormatOption},
         types::PrintToPdfOptions,
         Browser, LaunchOptionsBuilder,
     };
@@ -338,6 +459,10 @@ fn fetch_with_chrome(
             exts
         )));
     }
+    arg_vec.push(OsString::from(format!(
+        "--virtual-time-budget={}",
+        args.max_wait_ms
+    )));
 
     let launch_opts = LaunchOptionsBuilder::default()
         .headless(!args.headful)
@@ -354,7 +479,18 @@ fn fetch_with_chrome(
     let browser = Browser::new(launch_opts)?;
     let tab = browser.new_tab()?;
 
-    tab.set_user_agent(&ua_generator::ua::spoof_ua(), args.locale.as_deref(), None)?;
+    tab.call_method(AddScriptToEvaluateOnNewDocument {
+        source: INJECT_INSTRUMENT_JS.to_string(),
+        world_name: None,
+        include_command_line_api: None,
+        run_immediately: Some(true),
+    })?;
+
+    tab.set_user_agent(
+        &ua_generator::ua::spoof_ua(),
+        Some(&args.locale_or_default()),
+        Some("Windows"),
+    )?;
     if let Some(tz) = &args.tz {
         tab.call_method(SetTimezoneOverride {
             timezone_id: tz.clone(),
@@ -389,10 +525,15 @@ fn fetch_with_chrome(
         import_cookies_to_chrome(&tab, &list)?;
     }
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(args.max_wait_ms);
     tab.navigate_to(url)?;
     tab.wait_until_navigated()?;
-    std::thread::sleep(budget);
+    wait_for_ready_state(&tab, &args.wait_ready, deadline)?;
+    if let Some(sel) = &args.wait_selector {
+        wait_for_selector(&tab, sel, deadline)?;
+    }
+    wait_for_network_idle(&tab, args.network_idle_ms, deadline)?;
 
     if let Some(p) = &args.export_cookies {
         let list = export_cookies_from_chrome(&tab)?;

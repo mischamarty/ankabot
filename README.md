@@ -22,6 +22,22 @@ Disable PDF (just JSON/Screenshot):
 ./ankabot --no-pdf --screenshot yahoo.png https://yahoo.com
 ```
 
+### Wait controls
+
+Tune how long Chrome waits for the page to settle before printing. Defaults suit heavy portals:
+
+```bash
+./ankabot https://mail.ru \
+  --wait-ready complete \
+  --network-idle-ms 1200 \
+  --max-wait-ms 15000
+```
+
+* `--max-wait-ms` (default `12000`): overall deadline for waits
+* `--wait-ready` (default `complete`): document.readyState to await (`complete`|`interactive`|`none`)
+* `--network-idle-ms` (default `1000`): how long network must stay idle
+* `--wait-selector`: optional CSS selector to await
+
 ### Stateful profiles, cookies, and locale emulation
 
 ```bash
