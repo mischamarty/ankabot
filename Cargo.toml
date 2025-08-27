@@ -1,0 +1,24 @@
+[package]
+name = "ankabot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Spider with smart HTTP→headless fallback and screenshot support
+spider = { version = "2.37.156", features = [
+  # HTTP/client quality-of-life
+  "headers", "encoding", "cache", "ua_generator",
+
+  # Smart + Chrome
+  "smart", "chrome", "chrome_headless_new", "chrome_cpu",
+  "chrome_store_page", # to call Page::screenshot()
+  # Optional (uncomment as you need them):
+   "chrome_intercept",  # speed/traffic shaping under Chrome
+   "chrome_stealth",    # lowers bot-signal surface (use responsibly)
+] }
