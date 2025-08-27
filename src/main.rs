@@ -1,17 +1,21 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use serde::Serialize;
-use spider::features::chrome_common::CaptureScreenshotFormat;
-use spider::page::Page;
-use spider::page::AntiBotTech;
-use spider::website::{self, Website};
 use spider::configuration::WaitForIdleNetwork;
+use spider::features::chrome_common::CaptureScreenshotFormat;
+use spider::page::AntiBotTech;
+use spider::page::Page;
+use spider::website::{self, Website};
 
 use std::time::{Duration, Instant};
+use ua_generator::ua::spoof_ua;
 
 /// Simple probe utility using spider's smart HTTP→headless fallback.
 #[derive(Parser, Debug)]
-#[command(name = "spider-probe", about = "HTTP-first fetch with headless fallback")]
+#[command(
+    name = "spider-probe",
+    about = "HTTP-first fetch with headless fallback"
+)]
 struct Args {
     /// URL to fetch
     url: String,
@@ -54,7 +58,10 @@ async fn main() -> Result<()> {
 
     // Build a Website rooted at the provided URL but limit to just the root (depth=0).
     let mut site = Website::new(&args.url);
+    let ua = spoof_ua();
     site.with_depth(0) // single page
+        .with_limit(1) // ensure we crawl exactly one page
+        .with_user_agent(Some(ua)) // pretend to be a real browser
         .with_respect_robots_txt(true) // be polite by default
         .with_request_timeout(Some(Duration::from_secs(args.timeout_s)))
         .with_redirect_limit(10)
@@ -66,7 +73,10 @@ async fn main() -> Result<()> {
     // Smart scrape = HTTP first; escalate to Chrome only if needed (requires `smart` + `chrome` features).
     site.scrape_smart().await;
 
-    let pages = site.get_pages().expect("no pages captured");
+    let pages = match site.get_pages() {
+        Some(p) if !p.is_empty() => p,
+        _ => bail!("no pages captured"),
+    };
     let pages_crawled = pages.len();
 
     // Find the page corresponding to the root URL (there should be exactly one at depth=0).
@@ -99,7 +109,14 @@ async fn main() -> Result<()> {
     let screenshot_path = if let Some(path) = &args.screenshot {
         // full_page=true, omit_bg=true, format=PNG, quality=None, output_path=Some(path), clip=None
         let _bytes = page
-            .screenshot(true, true, CaptureScreenshotFormat::Png, None, Some(path), None)
+            .screenshot(
+                true,
+                true,
+                CaptureScreenshotFormat::Png,
+                None,
+                Some(path),
+                None,
+            )
             .await;
         Some(path.clone())
     } else {
@@ -127,4 +144,3 @@ async fn main() -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }
-
