@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::Parser;
 use serde::Serialize;
 use spider::configuration::WaitForIdleNetwork;
@@ -83,7 +83,26 @@ async fn main() -> Result<()> {
                 site.get_requires_javascript(),
                 site.get_links().len()
             );
-            bail!("no pages captured");
+
+            // Produce a minimal result rather than failing.
+            let http_status = site.get_initial_status_code().as_u16();
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let out = ProbeResult {
+                input_url: args.url.clone(),
+                final_url: args.url.clone(),
+                http_status,
+                redirected: false,
+                requires_javascript: site.get_requires_javascript(),
+                waf_detected: false,
+                anti_bot_vendor: None,
+                js_challenge_page: false,
+                screenshot_path: None,
+                html: String::new(),
+                elapsed_ms,
+                pages_crawled: 0,
+            };
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            return Ok(());
         }
     };
     let pages_crawled = pages.len();
