@@ -75,7 +75,16 @@ async fn main() -> Result<()> {
 
     let pages = match site.get_pages() {
         Some(p) if !p.is_empty() => p,
-        _ => bail!("no pages captured"),
+        _ => {
+            eprintln!(
+                "debug: status={:?}, initial_status={:?}, requires_js={}, links_found={}",
+                site.get_status(),
+                site.get_initial_status_code(),
+                site.get_requires_javascript(),
+                site.get_links().len()
+            );
+            bail!("no pages captured");
+        }
     };
     let pages_crawled = pages.len();
 
