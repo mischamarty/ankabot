@@ -26,7 +26,7 @@ fn profile_dir(profile: &str, override_dir: Option<PathBuf>) -> PathBuf {
         .join(profile)
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 struct Cli {
     /// URL to fetch
     url: String,
@@ -48,6 +48,9 @@ struct Cli {
     /// How long network must stay idle (pending requests 0)
     #[arg(long, default_value_t = 1000)]
     network_idle_ms: u64,
+    /// Regex of URLs to ignore when calculating network idle
+    #[arg(long)]
+    idle_ignore: Option<String>,
     /// Optional CSS selector to wait for
     #[arg(long)]
     wait_selector: Option<String>,
@@ -84,6 +87,12 @@ struct Cli {
     /// Proxy server URL (http:// or socks5://)
     #[arg(long)]
     proxy: Option<String>,
+    /// Disable Chrome's virtual time budget
+    #[arg(long)]
+    no_virtual_time: bool,
+    /// Retry in headful mode if headless fails
+    #[arg(long)]
+    headful_fallback: bool,
 }
 
 impl Cli {
@@ -155,13 +164,23 @@ async fn main() -> Result<()> {
         None
     };
 
-    let chrome = fetch_with_chrome(
+    let mut chrome_res = fetch_with_chrome(
         &args.url,
         args.screenshot.as_ref(),
         pdf_path.as_ref(),
         &args,
-    )
-    .context("headless-chrome render failed")?;
+    );
+    if chrome_res.is_err() && args.headful_fallback && !args.headful {
+        let mut retry = args.clone();
+        retry.headful = true;
+        chrome_res = fetch_with_chrome(
+            &args.url,
+            args.screenshot.as_ref(),
+            pdf_path.as_ref(),
+            &retry,
+        );
+    }
+    let chrome = chrome_res.context("headless-chrome render failed")?;
 
     print_json(Output {
         input_url: args.url,
@@ -317,33 +336,39 @@ fn export_cookies_from_chrome(tab: &headless_chrome::Tab) -> Result<Vec<CookieJs
     Ok(out)
 }
 
-const INJECT_INSTRUMENT_JS: &str = r#"
-(() => {
+fn build_instrument_js(ignore: &str) -> String {
+    format!(
+        r#"(() => {{
   if (window.__ankabot) return;
-  window.__ankabot = { pending: 0 };
-
-  if (performance && performance.setResourceTimingBufferSize) {
-    performance.setResourceTimingBufferSize(20000);
-  }
-
+  window.__ankabot = {{ pending: 0 }};
+  const IGNORE = new RegExp({:?});
   const ofetch = window.fetch;
-  if (ofetch) {
-    window.fetch = function(...args) {
-      window.__ankabot.pending++;
-      return ofetch.apply(this, args)
-        .catch(e => e)
-        .finally(() => { window.__ankabot.pending--; });
-    }
-  }
-
-  const oSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.send = function(...args) {
-    window.__ankabot.pending++;
-    this.addEventListener('loadend', () => { window.__ankabot.pending--; }, { once: true });
-    return oSend.apply(this, args);
-  };
-})();
-"#;
+  if (ofetch) {{
+    window.fetch = function(res, init) {{
+      const url = (typeof res === 'string') ? res : (res && res.url) || '';
+      if (!IGNORE.test(url)) window.__ankabot.pending++;
+      return ofetch.apply(this, arguments)
+        .finally(()=>{{ if (!IGNORE.test(url)) window.__ankabot.pending--; }});
+    }}
+  }}
+  const oopen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(m,u){{
+    this.__ankabotURL = u || '';
+    return oopen.apply(this, arguments);
+  }};
+  const osend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function(){{
+    if (!IGNORE.test(this.__ankabotURL||'')) window.__ankabot.pending++;
+    this.addEventListener('loadend', ()=>{{
+      if (!IGNORE.test(this.__ankabotURL||'')) window.__ankabot.pending--;
+    }}, {{ once:true }});
+    return osend.apply(this, arguments);
+  }};
+}})();
+"#,
+        ignore
+    )
+}
 
 fn wait_for_ready_state(tab: &headless_chrome::Tab, want: &str, deadline: Instant) -> Result<()> {
     if want.eq_ignore_ascii_case("none") {
@@ -420,6 +445,34 @@ fn wait_for_network_idle(
     Err(anyhow!("network idle timeout"))
 }
 
+fn wait_images_and_fonts(tab: &headless_chrome::Tab, deadline: Instant) -> Result<()> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("images/fonts timeout"));
+        }
+        let imgs_unloaded = tab
+            .evaluate(
+                "Array.from(document.images).filter(i=>!i.complete).length",
+                false,
+            )?
+            .value
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let fonts_ready = tab
+            .evaluate(
+                "document.fonts ? document.fonts.status === 'loaded' : true",
+                false,
+            )?
+            .value
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if imgs_unloaded == 0 && fonts_ready {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn fetch_with_chrome(
     url: &str,
     screenshot: Option<&PathBuf>,
@@ -430,7 +483,10 @@ fn fetch_with_chrome(
         protocol::cdp::Emulation::{
             SetGeolocationOverride, SetLocaleOverride, SetTimezoneOverride,
         },
-        protocol::cdp::Page::{AddScriptToEvaluateOnNewDocument, CaptureScreenshotFormatOption},
+        protocol::cdp::Page::{
+            AddScriptToEvaluateOnNewDocument, CaptureScreenshotFormatOption,
+            SetLifecycleEventsEnabled,
+        },
         types::PrintToPdfOptions,
         Browser, LaunchOptionsBuilder,
     };
@@ -445,6 +501,7 @@ fn fetch_with_chrome(
         OsString::from("--no-first-run"),
         OsString::from("--no-default-browser-check"),
         OsString::from("--hide-scrollbars"),
+        OsString::from("--disable-blink-features=AutomationControlled"),
     ];
     if !args.headful {
         arg_vec.push(OsString::from("--headless=new"));
@@ -459,10 +516,12 @@ fn fetch_with_chrome(
             exts
         )));
     }
-    arg_vec.push(OsString::from(format!(
-        "--virtual-time-budget={}",
-        args.max_wait_ms
-    )));
+    if !args.no_virtual_time {
+        arg_vec.push(OsString::from(format!(
+            "--virtual-time-budget={}",
+            args.max_wait_ms
+        )));
+    }
 
     let launch_opts = LaunchOptionsBuilder::default()
         .headless(!args.headful)
@@ -479,8 +538,36 @@ fn fetch_with_chrome(
     let browser = Browser::new(launch_opts)?;
     let tab = browser.new_tab()?;
 
+    tab.call_method(SetLifecycleEventsEnabled { enabled: true })?;
+
+    let inject_js = build_instrument_js(args.idle_ignore.as_deref().unwrap_or(""));
     tab.call_method(AddScriptToEvaluateOnNewDocument {
-        source: INJECT_INSTRUMENT_JS.to_string(),
+        source: inject_js,
+        world_name: None,
+        include_command_line_api: None,
+        run_immediately: Some(true),
+    })?;
+
+    const STEALTH_JS: &str = r#"
+(() => {
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  Object.defineProperty(navigator, 'languages', { get: () => ['en-AE','en','ar-AE'] });
+  Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+  window.chrome = window.chrome || { runtime: {} };
+  const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+  if (origQuery) {
+    window.navigator.permissions.query = (p) =>
+      p && p.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : origQuery(p);
+  }
+  const getD = (k, v) => Object.defineProperty(window, k, { get: () => v });
+  getD('outerWidth', 1366);
+  getD('outerHeight', 768);
+})();
+"#;
+    tab.call_method(AddScriptToEvaluateOnNewDocument {
+        source: STEALTH_JS.to_string(),
         world_name: None,
         include_command_line_api: None,
         run_immediately: Some(true),
@@ -571,6 +658,7 @@ fn fetch_with_chrome(
 
     let mut pdf_saved: Option<String> = None;
     if let Some(p) = pdf_path {
+        wait_images_and_fonts(&tab, deadline)?;
         let bytes = tab.print_to_pdf(Some(PrintToPdfOptions {
             print_background: Some(true),
             prefer_css_page_size: Some(true),
