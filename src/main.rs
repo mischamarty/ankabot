@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
 
 fn default_pdf_path(url: &str) -> PathBuf {
@@ -10,6 +10,17 @@ fn default_pdf_path(url: &str) -> PathBuf {
         .and_then(|u| u.host_str().map(|h| h.to_string()))
         .unwrap_or_else(|| "page".to_string());
     PathBuf::from(format!("{}-{}.pdf", host, ts))
+}
+
+fn profile_dir(profile: &str, override_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = override_dir {
+        return p;
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ankabot")
+        .join("profiles")
+        .join(profile)
 }
 
 #[derive(Parser, Debug)]
@@ -31,6 +42,36 @@ struct Cli {
     /// Save a screenshot (PNG) when Chrome is used
     #[arg(long)]
     screenshot: Option<PathBuf>,
+    /// Named Chrome profile for persistent sessions
+    #[arg(long, default_value = "default")]
+    profile: String,
+    /// Override the Chrome user-data-dir
+    #[arg(long)]
+    user_data_dir: Option<PathBuf>,
+    /// Import cookies from JSON file
+    #[arg(long)]
+    import_cookies: Option<PathBuf>,
+    /// Export cookies to JSON file
+    #[arg(long)]
+    export_cookies: Option<PathBuf>,
+    /// Locale / Accept-Language override
+    #[arg(long)]
+    locale: Option<String>,
+    /// Timezone override
+    #[arg(long)]
+    tz: Option<String>,
+    /// Geolocation "lat,lon[,accuracy]"
+    #[arg(long)]
+    geo: Option<String>,
+    /// Run Chrome in headful mode
+    #[arg(long)]
+    headful: bool,
+    /// Comma-separated list of extension dirs
+    #[arg(long)]
+    extensions: Option<String>,
+    /// Proxy server URL (http:// or socks5://)
+    #[arg(long)]
+    proxy: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -99,6 +140,7 @@ async fn main() -> Result<()> {
         Duration::from_millis(args.render_ms),
         args.screenshot.as_ref(),
         pdf_path.as_ref(),
+        &args,
     )
     .context("headless-chrome render failed")?;
 
@@ -189,39 +231,173 @@ struct ChromeRes {
     js_challenge: bool,
 }
 
+#[derive(Deserialize, Serialize)]
+struct CookieJson {
+    name: String,
+    value: String,
+    domain: String,
+    path: String,
+    secure: bool,
+    #[serde(default, rename = "httpOnly")]
+    http_only: bool,
+    #[serde(default)]
+    expires: Option<f64>,
+}
+
+fn import_cookies_to_chrome(tab: &headless_chrome::Tab, list: &[CookieJson]) -> Result<()> {
+    use headless_chrome::protocol::cdp::Network;
+
+    tab.call_method(Network::Enable {
+        max_total_buffer_size: None,
+        max_resource_buffer_size: None,
+        max_post_data_size: None,
+    })?;
+    let params: Vec<Network::CookieParam> = list
+        .iter()
+        .map(|c| Network::CookieParam {
+            name: c.name.clone(),
+            value: c.value.clone(),
+            url: None,
+            domain: Some(c.domain.clone()),
+            path: Some(c.path.clone()),
+            secure: Some(c.secure),
+            http_only: Some(c.http_only),
+            same_site: None,
+            expires: c.expires,
+            priority: None,
+            same_party: None,
+            source_scheme: None,
+            source_port: None,
+            partition_key: None,
+        })
+        .collect();
+    tab.call_method(Network::SetCookies { cookies: params })?;
+    Ok(())
+}
+
+fn export_cookies_from_chrome(tab: &headless_chrome::Tab) -> Result<Vec<CookieJson>> {
+    use headless_chrome::protocol::cdp::Network;
+    tab.call_method(Network::Enable {
+        max_total_buffer_size: None,
+        max_resource_buffer_size: None,
+        max_post_data_size: None,
+    })?;
+    let all = tab.get_cookies()?;
+    let out = all
+        .into_iter()
+        .map(|c| CookieJson {
+            name: c.name,
+            value: c.value,
+            domain: c.domain,
+            path: c.path,
+            secure: c.secure,
+            http_only: c.http_only,
+            expires: Some(c.expires),
+        })
+        .collect();
+    Ok(out)
+}
+
 fn fetch_with_chrome(
     url: &str,
     budget: Duration,
     screenshot: Option<&PathBuf>,
     pdf_path: Option<&PathBuf>,
+    args: &Cli,
 ) -> Result<ChromeRes> {
     use headless_chrome::{
-        protocol::cdp::Page::CaptureScreenshotFormatOption, types::PrintToPdfOptions, Browser,
-        LaunchOptionsBuilder,
+        protocol::cdp::Emulation::{
+            SetGeolocationOverride, SetLocaleOverride, SetTimezoneOverride,
+        },
+        protocol::cdp::Page::CaptureScreenshotFormatOption,
+        types::PrintToPdfOptions,
+        Browser, LaunchOptionsBuilder,
     };
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
+
+    let user_dir = profile_dir(&args.profile, args.user_data_dir.clone());
+    std::fs::create_dir_all(&user_dir)?;
+
+    let mut arg_vec: Vec<OsString> = vec![
+        OsString::from("--disable-gpu"),
+        OsString::from("--disable-dev-shm-usage"),
+        OsString::from("--no-first-run"),
+        OsString::from("--no-default-browser-check"),
+        OsString::from("--hide-scrollbars"),
+    ];
+    if !args.headful {
+        arg_vec.push(OsString::from("--headless=new"));
+    }
+    if let Some(p) = &args.proxy {
+        arg_vec.push(OsString::from(format!("--proxy-server={}", p)));
+    }
+    if let Some(exts) = &args.extensions {
+        arg_vec.push(OsString::from(format!("--load-extension={}", exts)));
+        arg_vec.push(OsString::from(format!(
+            "--disable-extensions-except={}",
+            exts
+        )));
+    }
 
     let launch_opts = LaunchOptionsBuilder::default()
-        .headless(true)
-        .args(vec![
-            OsStr::new("--headless=new"),
-            OsStr::new("--disable-gpu"),
-            OsStr::new("--disable-dev-shm-usage"),
-            OsStr::new("--no-first-run"),
-            OsStr::new("--no-default-browser-check"),
-            OsStr::new("--hide-scrollbars"),
-        ])
+        .headless(!args.headful)
+        .user_data_dir(Some(user_dir))
+        .args(
+            arg_vec
+                .iter()
+                .map(|s| s.as_os_str())
+                .collect::<Vec<&OsStr>>(),
+        )
         .build()
         .unwrap();
 
     let browser = Browser::new(launch_opts)?;
     let tab = browser.new_tab()?;
 
+    tab.set_user_agent(&ua_generator::ua::spoof_ua(), args.locale.as_deref(), None)?;
+    if let Some(tz) = &args.tz {
+        tab.call_method(SetTimezoneOverride {
+            timezone_id: tz.clone(),
+        })?;
+    }
+    if let Some(loc) = &args.locale {
+        tab.call_method(SetLocaleOverride {
+            locale: Some(loc.clone()),
+        })?;
+    }
+    if let Some(g) = &args.geo {
+        let parts: Vec<&str> = g.split(',').collect();
+        if parts.len() >= 2 {
+            if let (Ok(lat), Ok(lon)) = (parts[0].parse(), parts[1].parse()) {
+                let acc = if parts.len() > 2 {
+                    parts[2].parse().ok()
+                } else {
+                    None
+                };
+                tab.call_method(SetGeolocationOverride {
+                    latitude: Some(lat),
+                    longitude: Some(lon),
+                    accuracy: acc,
+                })?;
+            }
+        }
+    }
+
+    if let Some(p) = &args.import_cookies {
+        let bytes = std::fs::read(p)?;
+        let list: Vec<CookieJson> = serde_json::from_slice(&bytes)?;
+        import_cookies_to_chrome(&tab, &list)?;
+    }
+
     let start = std::time::Instant::now();
-    tab.set_user_agent(&ua_generator::ua::spoof_ua(), None, None)?;
     tab.navigate_to(url)?;
     tab.wait_until_navigated()?;
     std::thread::sleep(budget);
+
+    if let Some(p) = &args.export_cookies {
+        let list = export_cookies_from_chrome(&tab)?;
+        std::fs::write(p, serde_json::to_vec_pretty(&list)?)?;
+    }
 
     let body_text = tab
         .evaluate(
