@@ -3,10 +3,25 @@ use clap::Parser;
 use serde::Serialize;
 use std::{path::PathBuf, time::Duration};
 
+fn default_pdf_path(url: &str) -> PathBuf {
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| "page".to_string());
+    PathBuf::from(format!("{}-{}.pdf", host, ts))
+}
+
 #[derive(Parser, Debug)]
 struct Cli {
     /// URL to fetch
     url: String,
+    /// Save a PDF of the page (defaults to <host>-<timestamp>.pdf if not provided)
+    #[arg(long, conflicts_with = "no_pdf")]
+    pdf: Option<PathBuf>,
+    /// Do not save a PDF (overrides default behavior)
+    #[arg(long)]
+    no_pdf: bool,
     /// Always render with headless Chrome
     #[arg(long)]
     force_chrome: bool,
@@ -29,6 +44,7 @@ struct Output {
     anti_bot_vendor: Option<String>,
     js_challenge_page: bool,
     screenshot_path: Option<String>,
+    pdf_path: Option<String>,
     html: String,
     elapsed_ms: u64,
     pages_crawled: u32,
@@ -38,7 +54,9 @@ struct Output {
 async fn main() -> Result<()> {
     let args = Cli::parse();
 
-    if !args.force_chrome {
+    let want_pdf = !args.no_pdf || args.pdf.is_some();
+
+    if !args.force_chrome && !want_pdf {
         if let Ok(http_res) = fetch_http(&args.url).await {
             let looks_empty = http_res.html.trim().is_empty()
                 || http_res.html.len() < 512
@@ -56,6 +74,7 @@ async fn main() -> Result<()> {
                     anti_bot_vendor: http_res.anti_bot_vendor,
                     js_challenge_page: false,
                     screenshot_path: None,
+                    pdf_path: None,
                     html: http_res.html,
                     elapsed_ms: http_res.elapsed_ms,
                     pages_crawled: 0,
@@ -65,10 +84,21 @@ async fn main() -> Result<()> {
         }
     }
 
+    let pdf_path = if want_pdf {
+        Some(
+            args.pdf
+                .clone()
+                .unwrap_or_else(|| default_pdf_path(&args.url)),
+        )
+    } else {
+        None
+    };
+
     let chrome = fetch_with_chrome(
         &args.url,
         Duration::from_millis(args.render_ms),
         args.screenshot.as_ref(),
+        pdf_path.as_ref(),
     )
     .context("headless-chrome render failed")?;
 
@@ -82,6 +112,7 @@ async fn main() -> Result<()> {
         anti_bot_vendor: chrome.anti_bot_vendor,
         js_challenge_page: chrome.js_challenge,
         screenshot_path: chrome.screenshot_path,
+        pdf_path: chrome.pdf_path,
         html: chrome.html,
         elapsed_ms: chrome.elapsed_ms,
         pages_crawled: 1,
@@ -152,6 +183,7 @@ struct ChromeRes {
     html: String,
     elapsed_ms: u64,
     screenshot_path: Option<String>,
+    pdf_path: Option<String>,
     waf_detected: bool,
     anti_bot_vendor: Option<String>,
     js_challenge: bool,
@@ -161,19 +193,23 @@ fn fetch_with_chrome(
     url: &str,
     budget: Duration,
     screenshot: Option<&PathBuf>,
+    pdf_path: Option<&PathBuf>,
 ) -> Result<ChromeRes> {
     use headless_chrome::{
-        protocol::cdp::Page::CaptureScreenshotFormatOption, Browser, LaunchOptionsBuilder,
+        protocol::cdp::Page::CaptureScreenshotFormatOption, types::PrintToPdfOptions, Browser,
+        LaunchOptionsBuilder,
     };
     use std::ffi::OsStr;
 
     let launch_opts = LaunchOptionsBuilder::default()
         .headless(true)
         .args(vec![
+            OsStr::new("--headless=new"),
             OsStr::new("--disable-gpu"),
             OsStr::new("--disable-dev-shm-usage"),
             OsStr::new("--no-first-run"),
             OsStr::new("--no-default-browser-check"),
+            OsStr::new("--hide-scrollbars"),
         ])
         .build()
         .unwrap();
@@ -216,6 +252,21 @@ fn fetch_with_chrome(
         None
     };
 
+    let mut pdf_saved: Option<String> = None;
+    if let Some(p) = pdf_path {
+        let bytes = tab.print_to_pdf(Some(PrintToPdfOptions {
+            print_background: Some(true),
+            prefer_css_page_size: Some(true),
+            margin_top: Some(0.0),
+            margin_bottom: Some(0.0),
+            margin_left: Some(0.0),
+            margin_right: Some(0.0),
+            ..Default::default()
+        }))?;
+        std::fs::write(p, &bytes)?;
+        pdf_saved = Some(p.display().to_string());
+    }
+
     Ok(ChromeRes {
         final_url,
         status: None,
@@ -223,6 +274,7 @@ fn fetch_with_chrome(
         html,
         elapsed_ms: start.elapsed().as_millis() as u64,
         screenshot_path,
+        pdf_path: pdf_saved,
         waf_detected: challenge,
         anti_bot_vendor: None,
         js_challenge: challenge,
