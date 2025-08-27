@@ -1,40 +1,25 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Serialize;
-use spider::configuration::WaitForIdleNetwork;
-use spider::features::chrome_common::CaptureScreenshotFormat;
-use spider::page::AntiBotTech;
-use spider::page::Page;
-use spider::website::{self, Website};
+use std::{path::PathBuf, time::Duration};
 
-use std::time::{Duration, Instant};
-use ua_generator::ua::spoof_ua;
-
-/// Simple probe utility using spider's smart HTTP→headless fallback.
 #[derive(Parser, Debug)]
-#[command(
-    name = "spider-probe",
-    about = "HTTP-first fetch with headless fallback"
-)]
-struct Args {
+struct Cli {
     /// URL to fetch
     url: String,
-
-    /// Optional path to save a screenshot (PNG). Example: ./page.png
+    /// Always render with headless Chrome
     #[arg(long)]
-    screenshot: Option<String>,
-
-    /// Milliseconds to wait for network idle when in headless mode
-    #[arg(long, default_value = "1500")]
-    headless_idle_ms: u64,
-
-    /// Request timeout (seconds)
-    #[arg(long, default_value = "30")]
-    timeout_s: u64,
+    force_chrome: bool,
+    /// Milliseconds to allow page JS to settle under Chrome
+    #[arg(long, default_value_t = 6000)]
+    render_ms: u64,
+    /// Save a screenshot (PNG) when Chrome is used
+    #[arg(long)]
+    screenshot: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
-struct ProbeResult {
+struct Output {
     input_url: String,
     final_url: String,
     http_status: u16,
@@ -45,130 +30,206 @@ struct ProbeResult {
     js_challenge_page: bool,
     screenshot_path: Option<String>,
     html: String,
-    /// Total time spent in milliseconds
     elapsed_ms: u64,
-    /// Number of pages captured during the crawl
-    pages_crawled: usize,
+    pages_crawled: u32,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-    let start = Instant::now();
+    let args = Cli::parse();
 
-    // Build a Website rooted at the provided URL but limit to just the root (depth=0).
-    let mut site = Website::new(&args.url);
-    let ua = spoof_ua();
-    site.with_depth(0) // single page
-        .with_limit(1) // ensure we crawl exactly one page
-        .with_user_agent(Some(ua)) // pretend to be a real browser
-        .with_respect_robots_txt(true) // be polite by default
-        .with_request_timeout(Some(Duration::from_secs(args.timeout_s)))
-        .with_redirect_limit(10)
-        // Wait a bit for the page to settle when using headless
-        .with_wait_for_idle_network(Some(WaitForIdleNetwork::new(Some(Duration::from_millis(
-            args.headless_idle_ms,
-        )))));
+    if !args.force_chrome {
+        if let Ok(http_res) = fetch_http(&args.url).await {
+            let looks_empty = http_res.html.trim().is_empty()
+                || http_res.html.len() < 512
+                || !http_res.html.to_lowercase().contains("<body");
+            let needs_js = looks_empty || http_res.links_found == 0;
 
-    // Smart scrape = HTTP first; escalate to Chrome only if needed (requires `smart` + `chrome` features).
-    site.scrape_smart().await;
-
-    let pages = match site.get_pages() {
-        Some(p) if !p.is_empty() => p,
-        _ => {
-            eprintln!(
-                "debug: status={:?}, initial_status={:?}, requires_js={}, links_found={}",
-                site.get_status(),
-                site.get_initial_status_code(),
-                site.get_requires_javascript(),
-                site.get_links().len()
-            );
-
-            // Produce a minimal result rather than failing.
-            let http_status = site.get_initial_status_code().as_u16();
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            let out = ProbeResult {
-                input_url: args.url.clone(),
-                final_url: args.url.clone(),
-                http_status,
-                redirected: false,
-                requires_javascript: site.get_requires_javascript(),
-                waf_detected: false,
-                anti_bot_vendor: None,
-                js_challenge_page: false,
-                screenshot_path: None,
-                html: String::new(),
-                elapsed_ms,
-                pages_crawled: 0,
-            };
-            println!("{}", serde_json::to_string_pretty(&out)?);
-            return Ok(());
-        }
-    };
-    let pages_crawled = pages.len();
-
-    // Find the page corresponding to the root URL (there should be exactly one at depth=0).
-    let mut chosen: Option<&Page> = None;
-    for p in pages.iter() {
-        // Prefer exact match on final URL when available, otherwise the original.
-        if p.get_url() == args.url || p.get_url_final() == args.url {
-            chosen = Some(p);
-            break;
+            if !needs_js {
+                print_json(Output {
+                    input_url: args.url,
+                    final_url: http_res.final_url,
+                    http_status: http_res.status,
+                    redirected: http_res.redirected,
+                    requires_javascript: false,
+                    waf_detected: http_res.waf_detected,
+                    anti_bot_vendor: http_res.anti_bot_vendor,
+                    js_challenge_page: false,
+                    screenshot_path: None,
+                    html: http_res.html,
+                    elapsed_ms: http_res.elapsed_ms,
+                    pages_crawled: 0,
+                })?;
+                return Ok(());
+            }
         }
     }
-    // Fallback if the above heuristic didn't match
-    let page = chosen.unwrap_or_else(|| pages.first().expect("no page captured"));
 
-    let status = page.status_code.as_u16();
-    let (input_url, final_url) = (page.get_url().to_string(), page.get_url_final().to_string());
-    // Note: final_redirect_destination is not populated when Chrome handled the fetch path.
-    // In that case redirected==false may simply mean "unknown from HTTP path".
-    let redirected = final_url != input_url;
+    let chrome = fetch_with_chrome(
+        &args.url,
+        Duration::from_millis(args.render_ms),
+        args.screenshot.as_ref(),
+    )
+    .context("headless-chrome render failed")?;
 
-    // Detect WAF / anti-bot
-    let waf_detected = page.waf_check;
-    let anti_bot_vendor = match page.anti_bot_tech {
-        AntiBotTech::None => None,
-        ref other => Some(format!("{:?}", other)),
+    print_json(Output {
+        input_url: args.url,
+        final_url: chrome.final_url,
+        http_status: chrome.status.unwrap_or(200),
+        redirected: chrome.redirected,
+        requires_javascript: true,
+        waf_detected: chrome.waf_detected,
+        anti_bot_vendor: chrome.anti_bot_vendor,
+        js_challenge_page: chrome.js_challenge,
+        screenshot_path: chrome.screenshot_path,
+        html: chrome.html,
+        elapsed_ms: chrome.elapsed_ms,
+        pages_crawled: 1,
+    })?;
+
+    Ok(())
+}
+
+struct HttpRes {
+    final_url: String,
+    status: u16,
+    redirected: bool,
+    html: String,
+    links_found: usize,
+    elapsed_ms: u64,
+    waf_detected: bool,
+    anti_bot_vendor: Option<String>,
+}
+
+async fn fetch_http(url: &str) -> Result<HttpRes> {
+    let client = reqwest::Client::builder()
+        .user_agent(ua_generator::ua::spoof_ua())
+        .redirect(reqwest::redirect::Policy::limited(8))
+        .gzip(true)
+        .brotli(true)
+        .deflate(true)
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let start = std::time::Instant::now();
+    let resp = client.get(url).send().await?;
+    let status = resp.status().as_u16();
+    let final_url = resp.url().to_string();
+    let redirected = final_url != url;
+
+    let is_html = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(true);
+
+    let html = if is_html {
+        resp.text().await?
+    } else {
+        String::new()
     };
-    let js_challenge_page = website::is_safe_javascript_challenge(page);
 
-    // Optionally capture a screenshot (works when Chrome path was used; requires `chrome_store_page`).
-    let screenshot_path = if let Some(path) = &args.screenshot {
-        // full_page=true, omit_bg=true, format=PNG, quality=None, output_path=Some(path), clip=None
-        let _bytes = page
-            .screenshot(
-                true,
-                true,
-                CaptureScreenshotFormat::Png,
-                None,
-                Some(path),
-                None,
-            )
-            .await;
-        Some(path.clone())
+    let links_found = html.matches("<a ").count();
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    Ok(HttpRes {
+        final_url,
+        status,
+        redirected,
+        html,
+        links_found,
+        elapsed_ms,
+        waf_detected: false,
+        anti_bot_vendor: None,
+    })
+}
+
+struct ChromeRes {
+    final_url: String,
+    status: Option<u16>,
+    redirected: bool,
+    html: String,
+    elapsed_ms: u64,
+    screenshot_path: Option<String>,
+    waf_detected: bool,
+    anti_bot_vendor: Option<String>,
+    js_challenge: bool,
+}
+
+fn fetch_with_chrome(
+    url: &str,
+    budget: Duration,
+    screenshot: Option<&PathBuf>,
+) -> Result<ChromeRes> {
+    use headless_chrome::{
+        protocol::cdp::Page::CaptureScreenshotFormatOption, Browser, LaunchOptionsBuilder,
+    };
+    use std::ffi::OsStr;
+
+    let launch_opts = LaunchOptionsBuilder::default()
+        .headless(true)
+        .args(vec![
+            OsStr::new("--disable-gpu"),
+            OsStr::new("--disable-dev-shm-usage"),
+            OsStr::new("--no-first-run"),
+            OsStr::new("--no-default-browser-check"),
+        ])
+        .build()
+        .unwrap();
+
+    let browser = Browser::new(launch_opts)?;
+    let tab = browser.new_tab()?;
+
+    let start = std::time::Instant::now();
+    tab.set_user_agent(&ua_generator::ua::spoof_ua(), None, None)?;
+    tab.navigate_to(url)?;
+    tab.wait_until_navigated()?;
+    std::thread::sleep(budget);
+
+    let body_text = tab
+        .evaluate(
+            "document.body ? document.body.innerText.slice(0, 4096) : ''",
+            false,
+        )?
+        .value
+        .map(|v| v.to_string());
+    let challenge = body_text
+        .as_deref()
+        .map(|t| {
+            let l = t.to_ascii_lowercase();
+            l.contains("checking your browser")
+                || l.contains("verifying you are human")
+                || l.contains("press and hold")
+        })
+        .unwrap_or(false);
+
+    let html = tab.get_content()?;
+    let final_url = tab.get_url();
+    let redirected = final_url != url;
+
+    let screenshot_path = if let Some(p) = screenshot {
+        let png = tab.capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)?;
+        std::fs::write(p, png)?;
+        Some(p.display().to_string())
     } else {
         None
     };
 
-    let html = String::from_utf8_lossy(page.get_html_bytes_u8()).to_string();
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-
-    let out = ProbeResult {
-        input_url,
+    Ok(ChromeRes {
         final_url,
-        http_status: status,
+        status: None,
         redirected,
-        requires_javascript: site.get_requires_javascript(),
-        waf_detected,
-        anti_bot_vendor,
-        js_challenge_page,
-        screenshot_path,
         html,
-        elapsed_ms,
-        pages_crawled,
-    };
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        screenshot_path,
+        waf_detected: challenge,
+        anti_bot_vendor: None,
+        js_challenge: challenge,
+    })
+}
 
-    println!("{}", serde_json::to_string_pretty(&out)?);
+fn print_json<T: Serialize>(v: T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(())
 }
