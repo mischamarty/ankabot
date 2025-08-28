@@ -813,6 +813,26 @@ fn render_with_chrome(
                     let _ = std::fs::write(&shot_path, png);
                 }
 
+                let host = url::Url::parse(url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_string()))
+                    .unwrap_or_else(|| "page".to_string());
+                let pdf_file = dbg_dir.join(format!("{host}.pdf"));
+                let mut pdf_saved = None;
+                if let Ok(bytes) = tab.print_to_pdf(Some(PrintToPdfOptions {
+                    print_background: Some(true),
+                    prefer_css_page_size: Some(true),
+                    margin_top: Some(0.0),
+                    margin_bottom: Some(0.0),
+                    margin_left: Some(0.0),
+                    margin_right: Some(0.0),
+                    ..Default::default()
+                })) {
+                    if std::fs::write(&pdf_file, bytes).is_ok() {
+                        pdf_saved = Some(pdf_file.display().to_string());
+                    }
+                }
+
                 let report = TimeoutReport {
                     status: "timeout",
                     reason: msg,
@@ -829,7 +849,7 @@ fn render_with_chrome(
                     artifacts: Artifacts {
                         html: html_path.display().to_string(),
                         screenshot: shot_path.display().to_string(),
-                        pdf: None,
+                        pdf: pdf_saved,
                     },
                 };
                 Ok(RenderOutcome::Timeout(report))

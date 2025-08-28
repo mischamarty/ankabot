@@ -48,7 +48,7 @@ timeout report with debug artifacts. Control this behavior with:
 --debug-dir <path>                   (default: out/debug)
 ```
 
-`report` writes a JSON report and screenshot/HTML artifacts to the debug
+`report` writes a JSON report and screenshot/HTML/PDF artifacts to the debug
 directory and exits with code `2`. `continue` prints whatever HTML/PDF was
 collected and exits `0`. `fail` preserves the legacy panic behavior.
 

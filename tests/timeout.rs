@@ -15,4 +15,9 @@ fn reports_on_timeout() {
     assert_eq!(output.status.code(), Some(2));
     let v: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(v.get("status").and_then(|s| s.as_str()), Some("timeout"));
+    assert!(v
+        .get("artifacts")
+        .and_then(|a| a.get("pdf"))
+        .and_then(|p| p.as_str())
+        .is_some());
 }
