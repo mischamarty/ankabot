@@ -48,9 +48,15 @@ struct Cli {
     /// How long network must stay idle (pending requests 0)
     #[arg(long, default_value_t = 1000)]
     network_idle_ms: u64,
+    /// Pending request threshold to still consider the page idle
+    #[arg(long, default_value_t = 0)]
+    idle_threshold: u64,
     /// Regex of URLs to ignore when calculating network idle
     #[arg(long)]
     idle_ignore: Option<String>,
+    /// Minimum DOM text characters for heuristic readiness
+    #[arg(long, default_value_t = 1500)]
+    heuristic_min_chars: u64,
     /// Optional CSS selector to wait for
     #[arg(long)]
     wait_selector: Option<String>,
@@ -183,6 +189,7 @@ struct Output {
     html: String,
     elapsed_ms: u64,
     pages_crawled: u32,
+    wait_branch: String,
 }
 
 #[tokio::main]
@@ -213,6 +220,7 @@ async fn main() -> Result<()> {
                     html: http_res.html,
                     elapsed_ms: http_res.elapsed_ms,
                     pages_crawled: 0,
+                    wait_branch: "ready_state".to_string(),
                 })?;
                 return Ok(());
             }
@@ -263,6 +271,7 @@ async fn main() -> Result<()> {
                 html: chrome.html,
                 elapsed_ms: chrome.elapsed_ms,
                 pages_crawled: 1,
+                wait_branch: chrome.wait_branch,
             })?;
             Ok(())
         }
@@ -273,20 +282,28 @@ async fn main() -> Result<()> {
             }
             OnTimeout::Continue => {
                 let html = std::fs::read_to_string(&report.artifacts.html).unwrap_or_default();
+                let TimeoutReport {
+                    url,
+                    elapsed_ms,
+                    wait_branch,
+                    artifacts,
+                    ..
+                } = report;
                 print_json(Output {
                     input_url: args.url,
-                    final_url: report.url,
+                    final_url: url,
                     http_status: 0,
                     redirected: false,
                     requires_javascript: true,
                     waf_detected: false,
                     anti_bot_vendor: None,
                     js_challenge_page: false,
-                    screenshot_path: Some(report.artifacts.screenshot),
-                    pdf_path: report.artifacts.pdf,
+                    screenshot_path: Some(artifacts.screenshot),
+                    pdf_path: artifacts.pdf,
                     html,
-                    elapsed_ms: report.elapsed_ms,
+                    elapsed_ms,
                     pages_crawled: 1,
+                    wait_branch,
                 })?;
                 Ok(())
             }
@@ -361,6 +378,7 @@ struct ChromeRes {
     waf_detected: bool,
     anti_bot_vendor: Option<String>,
     js_challenge: bool,
+    wait_branch: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -463,28 +481,90 @@ fn build_instrument_js(ignore: &str) -> String {
         ignore
     )
 }
+fn wait_until_ready(
+    tab: &headless_chrome::Tab,
+    wait_ready: &str,
+    network_idle_ms: u64,
+    idle_threshold: u64,
+    heuristic_min_chars: u64,
+    deadline: Instant,
+) -> Result<String> {
+    let idle_dur = Duration::from_millis(network_idle_ms);
+    let mut last_cnt: i64 = -1;
+    let mut idle_since: Option<Instant> = None;
+    let mut heur_since: Option<Instant> = None;
 
-fn wait_for_ready_state(tab: &headless_chrome::Tab, want: &str, deadline: Instant) -> Result<()> {
-    if want.eq_ignore_ascii_case("none") {
-        return Ok(());
+    if wait_ready.eq_ignore_ascii_case("none") {
+        return Ok("ready_state".to_string());
     }
+
     loop {
         if Instant::now() >= deadline {
-            return Err(anyhow!("readyState timeout"));
+            return Err(anyhow!("wait_until_ready timeout"));
         }
-        let val = tab
+
+        let ready_state = tab
             .evaluate("document.readyState", false)?
             .value
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_default();
-        let ok = match want {
-            "interactive" => val == "interactive" || val == "complete",
-            _ => val == "complete",
+        let ready_ok = match wait_ready {
+            "interactive" => ready_state == "interactive" || ready_state == "complete",
+            _ => ready_state == "complete",
         };
-        if ok {
-            return Ok(());
+        if ready_ok {
+            return Ok("ready_state".to_string());
         }
-        std::thread::sleep(Duration::from_millis(100));
+
+        let pending = tab
+            .evaluate("window.__ankabot ? window.__ankabot.pending : 0", false)?
+            .value
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let cnt = tab
+            .evaluate("performance.getEntriesByType('resource').length", false)?
+            .value
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let stable = cnt == last_cnt;
+        if pending <= idle_threshold as i64 && stable {
+            if idle_since.is_none() {
+                idle_since = Some(Instant::now());
+            }
+            if Instant::now().duration_since(idle_since.unwrap()) >= idle_dur {
+                return Ok("network_idle".to_string());
+            }
+        } else {
+            idle_since = None;
+        }
+        last_cnt = cnt;
+
+        let val = tab
+            .evaluate(
+                "(() => { const t = document.body ? document.body.innerText.length : 0; const h = !!document.querySelector('main,article,#app,#root'); return {t:t, h:h}; })()",
+                false,
+            )?
+            .value
+            .unwrap_or_else(|| serde_json::json!({}));
+        let text_len = val.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
+        let has_main = val.get("h").and_then(|v| v.as_bool()).unwrap_or(false);
+        if text_len >= heuristic_min_chars && has_main {
+            if heur_since.is_none() {
+                heur_since = Some(Instant::now());
+            }
+            if Instant::now().duration_since(heur_since.unwrap()) >= Duration::from_millis(600) {
+                let settle_deadline = std::cmp::min(
+                    deadline,
+                    Instant::now() + Duration::from_millis(800),
+                );
+                let _ = wait_images_and_fonts(tab, settle_deadline);
+                return Ok("heuristic".to_string());
+            }
+        } else {
+            heur_since = None;
+        }
+
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -496,47 +576,6 @@ fn wait_for_selector(tab: &headless_chrome::Tab, sel: &str, deadline: Instant) -
         std::thread::sleep(Duration::from_millis(150));
     }
     Err(anyhow!("selector '{}' not found before timeout", sel))
-}
-
-fn wait_for_network_idle(
-    tab: &headless_chrome::Tab,
-    idle_ms: u64,
-    deadline: Instant,
-) -> Result<()> {
-    let idle = Duration::from_millis(idle_ms);
-    let mut last_cnt: i64 = -1;
-    let mut last_zero_since: Option<Instant> = None;
-
-    while Instant::now() < deadline {
-        let pending = tab
-            .evaluate("window.__ankabot ? window.__ankabot.pending : 0", false)?
-            .value
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let cnt = tab
-            .evaluate("performance.getEntriesByType('resource').length", false)?
-            .value
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-
-        let stable = cnt == last_cnt;
-        let zero_pending = pending == 0;
-
-        if zero_pending && stable {
-            if last_zero_since.is_none() {
-                last_zero_since = Some(Instant::now());
-            }
-            if Instant::now().duration_since(last_zero_since.unwrap()) >= idle {
-                return Ok(());
-            }
-        } else {
-            last_zero_since = None;
-        }
-
-        last_cnt = cnt;
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    Err(anyhow!("network idle timeout"))
 }
 
 fn wait_images_and_fonts(tab: &headless_chrome::Tab, deadline: Instant) -> Result<()> {
@@ -744,11 +783,17 @@ fn render_with_chrome(
         tab.wait_until_navigated()?;
         tab.call_method(BringToFront(None))?;
         tab.call_method(SetFocusEmulationEnabled { enabled: true })?;
-        wait_for_ready_state(&tab, &args.wait_ready, deadline)?;
+        let wait_branch = wait_until_ready(
+            &tab,
+            &args.wait_ready,
+            args.network_idle_ms,
+            args.idle_threshold,
+            args.heuristic_min_chars,
+            deadline,
+        )?;
         if let Some(sel) = &args.wait_selector {
             wait_for_selector(&tab, sel, deadline)?;
         }
-        wait_for_network_idle(&tab, args.network_idle_ms, deadline)?;
 
         if let Some(p) = &args.export_cookies {
             let list = export_cookies_from_chrome(&tab)?;
@@ -812,6 +857,7 @@ fn render_with_chrome(
             waf_detected: challenge,
             anti_bot_vendor: None,
             js_challenge: challenge,
+            wait_branch,
         })
     })();
 
