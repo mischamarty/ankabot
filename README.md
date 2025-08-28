@@ -38,6 +38,20 @@ Tune how long Chrome waits for the page to settle before printing. Defaults suit
 * `--network-idle-ms` (default `1000`): how long network must stay idle
 * `--wait-selector`: optional CSS selector to await
 
+### Timeout handling
+
+When page rendering exceeds the wait deadline, Ankabot can emit a structured
+timeout report with debug artifacts. Control this behavior with:
+
+```
+--on-timeout <continue|report|fail>  (default: report)
+--debug-dir <path>                   (default: out/debug)
+```
+
+`report` writes a JSON report and screenshot/HTML artifacts to the debug
+directory and exits with code `2`. `continue` prints whatever HTML/PDF was
+collected and exits `0`. `fail` preserves the legacy panic behavior.
+
 ### Stateful profiles, cookies, and locale emulation
 
 ```bash
