@@ -2,17 +2,45 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-fn default_pdf_path(url: &str) -> PathBuf {
+struct RunPaths {
+    run_dir: PathBuf,
+    pdf: PathBuf,
+    png: PathBuf,
+    dom_html: PathBuf,
+    http_raw: PathBuf,
+    console_log: PathBuf,
+    network_log: PathBuf,
+    result_json: PathBuf,
+}
+
+fn new_run_paths(
+    out_root: Option<PathBuf>,
+    run_dir_override: Option<PathBuf>,
+    url: &str,
+) -> anyhow::Result<RunPaths> {
+    let root = out_root.unwrap_or_else(|| PathBuf::from("out"));
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let host = url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_string()))
-        .unwrap_or_else(|| "page".to_string());
-    PathBuf::from(format!("{}-{}.pdf", host, ts))
+        .unwrap_or_else(|| "page".into());
+    let run = run_dir_override.unwrap_or_else(|| root.join(format!("{}-{}", host, ts)));
+    std::fs::create_dir_all(&run)?;
+    let abs = dunce::canonicalize(&run).unwrap_or(run.clone());
+    Ok(RunPaths {
+        run_dir: abs.clone(),
+        pdf: abs.join("page.pdf"),
+        png: abs.join("snap.png"),
+        dom_html: abs.join("dom.html"),
+        http_raw: abs.join("http_raw.html"),
+        console_log: abs.join("console.log"),
+        network_log: abs.join("network.txt"),
+        result_json: abs.join("result.json"),
+    })
 }
 
 fn profile_dir(profile: &str, override_dir: Option<PathBuf>) -> PathBuf {
@@ -30,15 +58,18 @@ fn profile_dir(profile: &str, override_dir: Option<PathBuf>) -> PathBuf {
 struct Cli {
     /// URL to fetch
     url: String,
-    /// Save a PDF of the page (defaults to <host>-<timestamp>.pdf if not provided)
-    #[arg(long, conflicts_with = "no_pdf")]
+    /// Legacy no-op alias for compatibility
+    #[arg(long, hide = true)]
     pdf: Option<PathBuf>,
-    /// Do not save a PDF (overrides default behavior)
-    #[arg(long)]
-    no_pdf: bool,
     /// Always render with headless Chrome
     #[arg(long)]
     force_chrome: bool,
+    /// Output root directory
+    #[arg(long, default_value = "./out")]
+    out_root: PathBuf,
+    /// Override run directory
+    #[arg(long)]
+    run_dir: Option<PathBuf>,
     /// Overall deadline for page load waits
     #[arg(long, default_value_t = 12000)]
     max_wait_ms: u64,
@@ -60,9 +91,6 @@ struct Cli {
     /// Optional CSS selector to wait for
     #[arg(long)]
     wait_selector: Option<String>,
-    /// Save a screenshot (PNG) when Chrome is used
-    #[arg(long)]
-    screenshot: Option<PathBuf>,
     /// Named Chrome profile for persistent sessions
     #[arg(long, default_value = "default")]
     profile: String,
@@ -186,27 +214,24 @@ struct Output {
     js_challenge_page: bool,
     screenshot_path: Option<String>,
     pdf_path: Option<String>,
-    html: String,
+    html_path: String,
     elapsed_ms: u64,
     pages_crawled: u32,
     wait_branch: String,
+    run_dir: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
+    let run_paths = new_run_paths(Some(args.out_root.clone()), args.run_dir.clone(), &args.url)?;
 
-    let want_pdf = !args.no_pdf || args.pdf.is_some();
-
-    if !args.force_chrome && !want_pdf {
-        if let Ok(http_res) = fetch_http(&args.url).await {
-            let looks_empty = http_res.html.trim().is_empty()
-                || http_res.html.len() < 512
-                || !http_res.html.to_lowercase().contains("<body");
-            let needs_js = looks_empty || http_res.links_found == 0;
+    if !args.force_chrome {
+        if let Ok(http_res) = fetch_http(&args.url, &run_paths.http_raw).await {
+            let needs_js = http_res.looks_empty || http_res.links_found == 0;
 
             if !needs_js {
-                print_json(Output {
+                let out = Output {
                     input_url: args.url,
                     final_url: http_res.final_url,
                     http_status: http_res.status,
@@ -217,47 +242,29 @@ async fn main() -> Result<()> {
                     js_challenge_page: false,
                     screenshot_path: None,
                     pdf_path: None,
-                    html: http_res.html,
+                    html_path: run_paths.http_raw.display().to_string(),
                     elapsed_ms: http_res.elapsed_ms,
                     pages_crawled: 0,
                     wait_branch: "ready_state".to_string(),
-                })?;
+                    run_dir: run_paths.run_dir.display().to_string(),
+                };
+                write_json(&run_paths.result_json, &out)?;
                 return Ok(());
             }
         }
     }
 
-    let pdf_path = if want_pdf {
-        Some(
-            args.pdf
-                .clone()
-                .unwrap_or_else(|| default_pdf_path(&args.url)),
-        )
-    } else {
-        None
-    };
-
-    let mut chrome_res = render_with_chrome(
-        &args.url,
-        args.screenshot.as_ref(),
-        pdf_path.as_ref(),
-        &args,
-    );
+    let mut chrome_res = render_with_chrome(&args.url, &run_paths, &args);
     if chrome_res.is_err() && args.headful_fallback && !args.headful {
         let mut retry = args.clone();
         retry.headful = true;
-        chrome_res = render_with_chrome(
-            &args.url,
-            args.screenshot.as_ref(),
-            pdf_path.as_ref(),
-            &retry,
-        );
+        chrome_res = render_with_chrome(&args.url, &run_paths, &retry);
     }
     let outcome = chrome_res.context("headless-chrome render failed")?;
 
     match outcome {
         RenderOutcome::Success(chrome) => {
-            print_json(Output {
+            let out = Output {
                 input_url: args.url,
                 final_url: chrome.final_url,
                 http_status: chrome.status.unwrap_or(200),
@@ -268,20 +275,21 @@ async fn main() -> Result<()> {
                 js_challenge_page: chrome.js_challenge,
                 screenshot_path: chrome.screenshot_path,
                 pdf_path: chrome.pdf_path,
-                html: chrome.html,
+                html_path: chrome.html_path,
                 elapsed_ms: chrome.elapsed_ms,
                 pages_crawled: 1,
                 wait_branch: chrome.wait_branch,
-            })?;
+                run_dir: run_paths.run_dir.display().to_string(),
+            };
+            write_json(&run_paths.result_json, &out)?;
             Ok(())
         }
         RenderOutcome::Timeout(report) => match args.on_timeout {
             OnTimeout::Report => {
-                print_json(report)?;
+                write_json(&run_paths.result_json, &report)?;
                 std::process::exit(2);
             }
             OnTimeout::Continue => {
-                let html = std::fs::read_to_string(&report.artifacts.html).unwrap_or_default();
                 let TimeoutReport {
                     url,
                     elapsed_ms,
@@ -289,7 +297,7 @@ async fn main() -> Result<()> {
                     artifacts,
                     ..
                 } = report;
-                print_json(Output {
+                let out = Output {
                     input_url: args.url,
                     final_url: url,
                     http_status: 0,
@@ -300,11 +308,13 @@ async fn main() -> Result<()> {
                     js_challenge_page: false,
                     screenshot_path: Some(artifacts.screenshot),
                     pdf_path: artifacts.pdf,
-                    html,
+                    html_path: artifacts.html,
                     elapsed_ms,
                     pages_crawled: 1,
                     wait_branch,
-                })?;
+                    run_dir: run_paths.run_dir.display().to_string(),
+                };
+                write_json(&run_paths.result_json, &out)?;
                 Ok(())
             }
             OnTimeout::Fail => Err(anyhow!(report.reason)),
@@ -316,14 +326,14 @@ struct HttpRes {
     final_url: String,
     status: u16,
     redirected: bool,
-    html: String,
     links_found: usize,
+    looks_empty: bool,
     elapsed_ms: u64,
     waf_detected: bool,
     anti_bot_vendor: Option<String>,
 }
 
-async fn fetch_http(url: &str) -> Result<HttpRes> {
+async fn fetch_http(url: &str, html_path: &Path) -> Result<HttpRes> {
     let client = reqwest::Client::builder()
         .user_agent(ua_generator::ua::spoof_ua())
         .redirect(reqwest::redirect::Policy::limited(8))
@@ -351,16 +361,19 @@ async fn fetch_http(url: &str) -> Result<HttpRes> {
     } else {
         String::new()
     };
+    std::fs::write(html_path, &html)?;
 
     let links_found = html.matches("<a ").count();
+    let looks_empty =
+        html.trim().is_empty() || html.len() < 512 || !html.to_lowercase().contains("<body");
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     Ok(HttpRes {
         final_url,
         status,
         redirected,
-        html,
         links_found,
+        looks_empty,
         elapsed_ms,
         waf_detected: false,
         anti_bot_vendor: None,
@@ -371,7 +384,7 @@ struct ChromeRes {
     final_url: String,
     status: Option<u16>,
     redirected: bool,
-    html: String,
+    html_path: String,
     elapsed_ms: u64,
     screenshot_path: Option<String>,
     pdf_path: Option<String>,
@@ -553,10 +566,8 @@ fn wait_until_ready(
                 heur_since = Some(Instant::now());
             }
             if Instant::now().duration_since(heur_since.unwrap()) >= Duration::from_millis(600) {
-                let settle_deadline = std::cmp::min(
-                    deadline,
-                    Instant::now() + Duration::from_millis(800),
-                );
+                let settle_deadline =
+                    std::cmp::min(deadline, Instant::now() + Duration::from_millis(800));
                 let _ = wait_images_and_fonts(tab, settle_deadline);
                 return Ok("heuristic".to_string());
             }
@@ -606,20 +617,15 @@ fn wait_images_and_fonts(tab: &headless_chrome::Tab, deadline: Instant) -> Resul
     }
 }
 
-fn render_with_chrome(
-    url: &str,
-    screenshot: Option<&PathBuf>,
-    pdf_path: Option<&PathBuf>,
-    args: &Cli,
-) -> Result<RenderOutcome> {
+fn render_with_chrome(url: &str, paths: &RunPaths, args: &Cli) -> Result<RenderOutcome> {
     use headless_chrome::{
         protocol::cdp::Emulation::{
             SetDeviceMetricsOverride, SetFocusEmulationEnabled, SetGeolocationOverride,
             SetLocaleOverride, SetTimezoneOverride,
         },
         protocol::cdp::Page::{
-            AddScriptToEvaluateOnNewDocument, BringToFront,
-            CaptureScreenshotFormatOption, SetLifecycleEventsEnabled,
+            AddScriptToEvaluateOnNewDocument, BringToFront, CaptureScreenshotFormatOption,
+            SetLifecycleEventsEnabled,
         },
         types::PrintToPdfOptions,
         Browser, LaunchOptionsBuilder,
@@ -818,39 +824,32 @@ fn render_with_chrome(
             .unwrap_or(false);
 
         let html = tab.get_content()?;
+        std::fs::write(&paths.dom_html, &html)?;
         let final_url = tab.get_url();
         let redirected = final_url != url;
 
-        let screenshot_path = if let Some(p) = screenshot {
-            let png =
-                tab.capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)?;
-            std::fs::write(p, png)?;
-            Some(p.display().to_string())
-        } else {
-            None
-        };
+        let png = tab.capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)?;
+        std::fs::write(&paths.png, png)?;
+        let screenshot_path = Some(paths.png.display().to_string());
 
-        let mut pdf_saved: Option<String> = None;
-        if let Some(p) = pdf_path {
-            wait_images_and_fonts(&tab, deadline)?;
-            let bytes = tab.print_to_pdf(Some(PrintToPdfOptions {
-                print_background: Some(true),
-                prefer_css_page_size: Some(true),
-                margin_top: Some(0.0),
-                margin_bottom: Some(0.0),
-                margin_left: Some(0.0),
-                margin_right: Some(0.0),
-                ..Default::default()
-            }))?;
-            std::fs::write(p, &bytes)?;
-            pdf_saved = Some(p.display().to_string());
-        }
+        wait_images_and_fonts(&tab, deadline)?;
+        let bytes = tab.print_to_pdf(Some(PrintToPdfOptions {
+            print_background: Some(true),
+            prefer_css_page_size: Some(true),
+            margin_top: Some(0.0),
+            margin_bottom: Some(0.0),
+            margin_left: Some(0.0),
+            margin_right: Some(0.0),
+            ..Default::default()
+        }))?;
+        std::fs::write(&paths.pdf, &bytes)?;
+        let pdf_saved = Some(paths.pdf.display().to_string());
 
         Ok(ChromeRes {
             final_url,
             status: None,
             redirected,
-            html,
+            html_path: paths.dom_html.display().to_string(),
             elapsed_ms: start.elapsed().as_millis() as u64,
             screenshot_path,
             pdf_path: pdf_saved,
@@ -958,7 +957,8 @@ fn render_with_chrome(
     }
 }
 
-fn print_json<T: Serialize>(v: T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(&v)?);
+fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<()> {
+    std::fs::write(path, serde_json::to_string_pretty(v)?)?;
+    println!("{}", path.display());
     Ok(())
 }

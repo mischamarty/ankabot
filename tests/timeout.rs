@@ -13,7 +13,9 @@ fn reports_on_timeout() {
         .output()
         .expect("run ankabot");
     assert_eq!(output.status.code(), Some(2));
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    let path = std::str::from_utf8(&output.stdout).unwrap().trim();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).expect("json");
     assert_eq!(v.get("status").and_then(|s| s.as_str()), Some("timeout"));
     assert!(v
         .get("artifacts")
