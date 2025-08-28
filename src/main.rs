@@ -78,6 +78,15 @@ struct Cli {
     /// Geolocation "lat,lon[,accuracy]"
     #[arg(long)]
     geo: Option<String>,
+    /// Viewport size "WIDTHxHEIGHT"
+    #[arg(long, default_value = "1366x768")]
+    window: String,
+    /// Device pixel ratio
+    #[arg(long, default_value_t = 1.0)]
+    dpr: f64,
+    /// Emulate a mobile device
+    #[arg(long, default_value_t = false)]
+    mobile: bool,
     /// Run Chrome in headful mode
     #[arg(long)]
     headful: bool,
@@ -106,6 +115,16 @@ impl Cli {
         self.locale
             .clone()
             .unwrap_or_else(|| "en-US,en;q=0.9".to_string())
+    }
+
+    fn window_size(&self) -> (u32, u32) {
+        let parts: Vec<&str> = self.window.to_lowercase().split('x').collect();
+        if parts.len() == 2 {
+            if let (Ok(w), Ok(h)) = (parts[0].parse(), parts[1].parse()) {
+                return (w, h);
+            }
+        }
+        (1366, 768)
     }
 }
 
@@ -555,11 +574,12 @@ fn render_with_chrome(
 ) -> Result<RenderOutcome> {
     use headless_chrome::{
         protocol::cdp::Emulation::{
-            SetGeolocationOverride, SetLocaleOverride, SetTimezoneOverride,
+            SetDeviceMetricsOverride, SetFocusEmulationEnabled, SetGeolocationOverride,
+            SetLocaleOverride, SetTimezoneOverride,
         },
         protocol::cdp::Page::{
-            AddScriptToEvaluateOnNewDocument, CaptureScreenshotFormatOption,
-            SetLifecycleEventsEnabled,
+            AddScriptToEvaluateOnNewDocument, BringToFront,
+            CaptureScreenshotFormatOption, SetLifecycleEventsEnabled,
         },
         types::PrintToPdfOptions,
         Browser, LaunchOptionsBuilder,
@@ -569,6 +589,8 @@ fn render_with_chrome(
     let user_dir = profile_dir(&args.profile, args.user_data_dir.clone());
     std::fs::create_dir_all(&user_dir)?;
 
+    let (win_w, win_h) = args.window_size();
+
     let mut arg_vec: Vec<OsString> = vec![
         OsString::from("--disable-gpu"),
         OsString::from("--disable-dev-shm-usage"),
@@ -576,6 +598,10 @@ fn render_with_chrome(
         OsString::from("--no-default-browser-check"),
         OsString::from("--hide-scrollbars"),
         OsString::from("--disable-blink-features=AutomationControlled"),
+        OsString::from("--disable-background-timer-throttling"),
+        OsString::from("--disable-renderer-backgrounding"),
+        OsString::from("--disable-backgrounding-occluded-windows"),
+        OsString::from(format!("--window-size={},{}", win_w, win_h)),
     ];
     if !args.headful {
         arg_vec.push(OsString::from("--headless=new"));
@@ -614,6 +640,21 @@ fn render_with_chrome(
 
     tab.call_method(SetLifecycleEventsEnabled { enabled: true })?;
 
+    tab.call_method(SetDeviceMetricsOverride {
+        width: win_w as i64,
+        height: win_h as i64,
+        device_scale_factor: args.dpr,
+        mobile: args.mobile,
+        scale: None,
+        screen_width: None,
+        screen_height: None,
+        position_x: None,
+        position_y: None,
+        dont_set_visible_size: None,
+        screen_orientation: None,
+        viewport: None,
+    })?;
+
     let inject_js = build_instrument_js(args.idle_ignore.as_deref().unwrap_or(""));
     tab.call_method(AddScriptToEvaluateOnNewDocument {
         source: inject_js,
@@ -622,26 +663,32 @@ fn render_with_chrome(
         run_immediately: Some(true),
     })?;
 
-    const STEALTH_JS: &str = r#"
-(() => {
-  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  Object.defineProperty(navigator, 'languages', { get: () => ['en-AE','en','ar-AE'] });
-  Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
-  window.chrome = window.chrome || { runtime: {} };
+    let stealth_js = format!(
+        r#"
+(() => {{
+  Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
+  Object.defineProperty(document, 'hidden', {{ get: () => false }});
+  Object.defineProperty(document, 'visibilityState', {{ get: () => 'visible' }});
+  window.chrome = window.chrome || {{ runtime: {{}} }};
+  Object.defineProperty(navigator, 'languages', {{ get: () => ['en-AE','en','ar-AE'] }});
+  Object.defineProperty(navigator, 'plugins', {{ get: () => [1,2,3] }});
   const origQuery = window.navigator.permissions && window.navigator.permissions.query;
-  if (origQuery) {
+  if (origQuery) {{
     window.navigator.permissions.query = (p) =>
       p && p.name === 'notifications'
-        ? Promise.resolve({ state: Notification.permission })
+        ? Promise.resolve({{ state: Notification.permission }})
         : origQuery(p);
-  }
-  const getD = (k, v) => Object.defineProperty(window, k, { get: () => v });
-  getD('outerWidth', 1366);
-  getD('outerHeight', 768);
-})();
-"#;
+  }}
+  const getD = (k, v) => Object.defineProperty(window, k, {{ get: () => v }});
+  getD('outerWidth', {width});
+  getD('outerHeight', {height});
+}})();
+"#,
+        width = win_w,
+        height = win_h
+    );
     tab.call_method(AddScriptToEvaluateOnNewDocument {
-        source: STEALTH_JS.to_string(),
+        source: stealth_js,
         world_name: None,
         include_command_line_api: None,
         run_immediately: Some(true),
@@ -692,6 +739,8 @@ fn render_with_chrome(
     let res: Result<ChromeRes> = (|| {
         tab.navigate_to(url)?;
         tab.wait_until_navigated()?;
+        tab.call_method(BringToFront {})?;
+        tab.call_method(SetFocusEmulationEnabled { enabled: true })?;
         wait_for_ready_state(&tab, &args.wait_ready, deadline)?;
         if let Some(sel) = &args.wait_selector {
             wait_for_selector(&tab, sel, deadline)?;
