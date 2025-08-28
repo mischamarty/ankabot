@@ -118,7 +118,8 @@ impl Cli {
     }
 
     fn window_size(&self) -> (u32, u32) {
-        let parts: Vec<&str> = self.window.to_lowercase().split('x').collect();
+        let lower = self.window.to_lowercase();
+        let parts: Vec<&str> = lower.split('x').collect();
         if parts.len() == 2 {
             if let (Ok(w), Ok(h)) = (parts[0].parse(), parts[1].parse()) {
                 return (w, h);
@@ -641,8 +642,8 @@ fn render_with_chrome(
     tab.call_method(SetLifecycleEventsEnabled { enabled: true })?;
 
     tab.call_method(SetDeviceMetricsOverride {
-        width: win_w as i64,
-        height: win_h as i64,
+        width: win_w,
+        height: win_h,
         device_scale_factor: args.dpr,
         mobile: args.mobile,
         scale: None,
@@ -653,6 +654,8 @@ fn render_with_chrome(
         dont_set_visible_size: None,
         screen_orientation: None,
         viewport: None,
+        display_feature: None,
+        device_posture: None,
     })?;
 
     let inject_js = build_instrument_js(args.idle_ignore.as_deref().unwrap_or(""));
@@ -739,7 +742,7 @@ fn render_with_chrome(
     let res: Result<ChromeRes> = (|| {
         tab.navigate_to(url)?;
         tab.wait_until_navigated()?;
-        tab.call_method(BringToFront {})?;
+        tab.call_method(BringToFront(None))?;
         tab.call_method(SetFocusEmulationEnabled { enabled: true })?;
         wait_for_ready_state(&tab, &args.wait_ready, deadline)?;
         if let Some(sel) = &args.wait_selector {
